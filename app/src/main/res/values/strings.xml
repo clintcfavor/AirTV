@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AirTV</string>
+    <string name="hint">On your iPhone, iPad or Mac, open Control Center, choose Screen Mirroring, then pick “%1$s”.</string>
+    <string name="status_ready">● Ready for AirPlay</string>
+    <string name="status_failed">Receiver failed to start (error %1$d)</string>
+    <string name="address">%1$s · port %2$d</string>
+    <string name="fps_counter">%1$.0f fps · %2$d ms</string>
+    <string name="no_network">Not connected to a network</string>
+</resources>
