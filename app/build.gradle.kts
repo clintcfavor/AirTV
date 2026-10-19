@@ -56,4 +56,7 @@ kotlin {
 
 dependencies {
     implementation("com.android.ndk.thirdparty:openssl:1.1.1q-beta-1")
+    implementation("androidx.media3:media3-exoplayer:1.8.0")
+    implementation("androidx.media3:media3-exoplayer-hls:1.8.0")
+    implementation("androidx.media3:media3-ui:1.8.0")
 }

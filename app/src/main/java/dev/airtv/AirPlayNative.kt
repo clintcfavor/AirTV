@@ -17,6 +17,14 @@ interface AirPlayListener {
     fun onAudioFlush()
     fun onVolume(db: Float)
     fun onMetadata(title: String, artist: String, album: String)
+
+    // AirPlay video casting (the sender's AirPlay button rather than screen mirroring).
+    fun onCastPlay(url: String, startSeconds: Float)
+    fun onCastScrub(seconds: Float)
+    fun onCastRate(rate: Float)
+    fun onCastStop()
+    /** [duration, position, seekStart, seekDuration, rate, bufferEmpty, bufferFull]; see CastPlayer. */
+    fun castPlaybackInfo(): DoubleArray
 }
 
 object AirPlayNative {
@@ -34,6 +42,8 @@ object AirPlayNative {
         width: Int,
         height: Int,
         fps: Int,
+        /** Preferred languages, colon separated ("en-US:en"), for picking cast audio/subtitles. */
+        languages: String,
     ): Int
 
     @JvmStatic

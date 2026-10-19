@@ -50,12 +50,19 @@ jmethodID m_audio_flush;
 jmethodID m_volume;
 jmethodID m_connection;
 jmethodID m_metadata;
+jmethodID m_cast_play;
+jmethodID m_cast_scrub;
+jmethodID m_cast_rate;
+jmethodID m_cast_stop;
+jmethodID m_cast_info;
 
 std::mutex g_lock;
 raop_t *g_raop = nullptr;
 dnssd_t *g_dnssd = nullptr;
 int g_open_connections = 0;
 double g_client_volume = 0.0;
+/* raop_set_lang() keeps these pointers, so they must outlive the receiver. */
+std::string g_lang_system;
 
 ALACDecoder *g_alac = nullptr;
 std::vector<uint8_t> g_pcm;
@@ -174,10 +181,35 @@ void cb_conn_reset(void *, int reason) {
 void cb_conn_feedback(void *) {
 }
 
+void cast_stop(JNIEnv *env) {
+    env->CallVoidMethod(listener(), m_cast_stop);
+    check_exception(env);
+}
+
 void cb_video_reset(void *, reset_type_t type) {
     LOGI("video reset, type %d", (int) type);
     JNIEnv *env = env_for_thread();
     if (!env || !listener()) return;
+    switch (type) {
+    case RESET_TYPE_ON_VIDEO_PLAY:
+        /* A cast is starting; nothing to tear down. */
+        return;
+    case RESET_TYPE_NOHOLD:
+        /* A new sender took over: drop the previous sender's cast as well as its mirroring. */
+        cast_stop(env);
+        if (g_raop) raop_destroy_airplay_video(g_raop, -1);
+        break;
+    case RESET_TYPE_HLS_SHUTDOWN:
+    case RESET_TYPE_HLS_EOS:
+        cast_stop(env);
+        if (g_raop) {
+            raop_destroy_airplay_video(g_raop, -1);
+            if (type == RESET_TYPE_HLS_SHUTDOWN) raop_remove_hls_connections(g_raop);
+        }
+        break;
+    default:
+        break;
+    }
     env->CallVoidMethod(listener(), m_video_reset);
     check_exception(env);
 }
@@ -365,24 +397,88 @@ const char *cb_passwd(void *, int *len) {
     return nullptr;
 }
 
-/* HLS ("AirPlay a YouTube video") is not advertised, these are never expected to fire. */
-void cb_on_video_play(void *, const char *, const float) {
+/*
+ * AirPlay video casting: the sender hands over a stream URL (an http(s) URL from apps such
+ * as GlobeTV or Safari, or a localhost master playlist that UxPlay rebuilds for YouTube) and
+ * the TV plays it itself with ExoPlayer, at the stream's own frame rate. The sender just
+ * polls playback-info, so its screen can be locked.
+ */
+void cb_on_video_play(void *, const char *location, const float start_position) {
+    LOGI("cast play %s from %.1fs", location, start_position);
+    JNIEnv *env = env_for_thread();
+    if (!env || !listener()) return;
+    jstring jlocation = env->NewStringUTF(location);
+    env->CallVoidMethod(listener(), m_cast_play, jlocation, (jfloat) start_position);
+    env->DeleteLocalRef(jlocation);
+    check_exception(env);
 }
 
-void cb_on_video_scrub(void *, const float) {
+void cb_on_video_scrub(void *, const float position) {
+    JNIEnv *env = env_for_thread();
+    if (!env || !listener()) return;
+    env->CallVoidMethod(listener(), m_cast_scrub, (jfloat) position);
+    check_exception(env);
 }
 
-void cb_on_video_rate(void *, const float) {
+void cb_on_video_rate(void *, const float rate) {
+    JNIEnv *env = env_for_thread();
+    if (!env || !listener()) return;
+    env->CallVoidMethod(listener(), m_cast_rate, (jfloat) rate);
+    check_exception(env);
 }
 
 void cb_on_video_stop(void *) {
+    JNIEnv *env = env_for_thread();
+    if (!env || !listener()) return;
+    cast_stop(env);
 }
 
-void cb_on_video_acquire_playback_info(void *, playback_info_t *) {
+/*
+ * Fills playback_info from the Kotlin player's snapshot:
+ * [duration, position, seekStart, seekDuration, rate, bufferEmpty, bufferFull].
+ * position -1 means "not ready yet"; duration -1 means "finished" (UxPlay then tears down).
+ */
+void cb_on_video_acquire_playback_info(void *, playback_info_t *info) {
+    info->duration = 0;
+    info->position = -1.0;
+    info->seek_start = 0;
+    info->seek_duration = 0;
+    info->rate = 0;
+    info->ready_to_play = false;
+    info->playback_buffer_empty = true;
+    info->playback_buffer_full = false;
+    info->playback_likely_to_keep_up = false;
+
+    JNIEnv *env = env_for_thread();
+    if (!env || !listener()) return;
+    auto values = (jdoubleArray) env->CallObjectMethod(listener(), m_cast_info);
+    check_exception(env);
+    if (!values) return;
+    if (env->GetArrayLength(values) >= 7) {
+        jdouble v[7];
+        env->GetDoubleArrayRegion(values, 0, 7, v);
+        info->duration = v[0];
+        info->position = v[1];
+        info->seek_start = v[2];
+        info->seek_duration = v[3];
+        info->rate = (float) v[4];
+        info->playback_buffer_empty = v[5] != 0;
+        info->playback_buffer_full = v[6] != 0;
+        info->ready_to_play = info->position >= 0;
+        info->playback_likely_to_keep_up = !info->playback_buffer_empty;
+    }
+    env->DeleteLocalRef(values);
 }
 
+/* The sender is swapping playlists (e.g. YouTube ads): pause and report where we were. */
 float cb_on_video_playlist_remove(void *) {
-    return 0.0f;
+    JNIEnv *env = env_for_thread();
+    if (!env || !listener()) return 0.0f;
+    env->CallVoidMethod(listener(), m_cast_rate, (jfloat) 0.0f);
+    check_exception(env);
+    playback_info_t info;
+    cb_on_video_acquire_playback_info(nullptr, &info);
+    return info.position > 0 ? (float) info.position : 0.0f;
 }
 
 void cb_log(void *, int level, const char *msg) {
@@ -403,10 +499,11 @@ bool parse_mac(const char *mac, std::vector<char> &out) {
     return true;
 }
 
-/* Feature bits as configured by UxPlay's start_dnssd(), without HLS and H.265. */
+/* Feature bits as configured by UxPlay's start_dnssd() with -hls (bits 0 Video and
+   4 VideoHTTPLiveStreams), without H.265. */
 void configure_features(dnssd_t *dnssd) {
-    const int on[] = {1, 2, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 27, 28, 30};
-    const int off[] = {0, 3, 4, 8, 23, 24, 26, 29, 31, 42};
+    const int on[] = {0, 1, 2, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 25, 27, 28, 30};
+    const int off[] = {3, 8, 23, 24, 26, 29, 31, 42};
     for (int bit : on) dnssd_set_airplay_features(dnssd, bit, 1);
     for (int bit : off) dnssd_set_airplay_features(dnssd, bit, 0);
 }
@@ -441,7 +538,8 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM *vm, void *) {
 
 extern "C" JNIEXPORT jint JNICALL
 Java_dev_airtv_AirPlayNative_nativeStart(JNIEnv *env, jclass, jobject jlistener, jstring jname,
-                                         jstring jmac, jstring jkeyfile, jint width, jint height, jint fps) {
+                                         jstring jmac, jstring jkeyfile, jint width, jint height, jint fps,
+                                         jstring jlanguages) {
     stop_locked();
 
     if (g_listener) {
@@ -462,6 +560,11 @@ Java_dev_airtv_AirPlayNative_nativeStart(JNIEnv *env, jclass, jobject jlistener,
     m_volume = env->GetMethodID(cls, "onVolume", "(F)V");
     m_connection = env->GetMethodID(cls, "onConnection", "(Z)V");
     m_metadata = env->GetMethodID(cls, "onMetadata", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+    m_cast_play = env->GetMethodID(cls, "onCastPlay", "(Ljava/lang/String;F)V");
+    m_cast_scrub = env->GetMethodID(cls, "onCastScrub", "(F)V");
+    m_cast_rate = env->GetMethodID(cls, "onCastRate", "(F)V");
+    m_cast_stop = env->GetMethodID(cls, "onCastStop", "()V");
+    m_cast_info = env->GetMethodID(cls, "castPlaybackInfo", "()[D");
     env->DeleteLocalRef(cls);
     if (env->ExceptionCheck()) {
         env->ExceptionDescribe();
@@ -476,6 +579,9 @@ Java_dev_airtv_AirPlayNative_nativeStart(JNIEnv *env, jclass, jobject jlistener,
     env->ReleaseStringUTFChars(jname, name);
     env->ReleaseStringUTFChars(jmac, mac);
     env->ReleaseStringUTFChars(jkeyfile, keyfile);
+    const char *languages = env->GetStringUTFChars(jlanguages, nullptr);
+    g_lang_system = (languages && *languages) ? languages : "en";
+    env->ReleaseStringUTFChars(jlanguages, languages);
 
     std::vector<char> hw_addr;
     if (!parse_mac(mac_str.c_str(), hw_addr)) {
@@ -558,6 +664,11 @@ Java_dev_airtv_AirPlayNative_nativeStart(JNIEnv *env, jclass, jobject jlistener,
     }
     /* Log the sender's once-a-second streaming report (its chosen fps, drops, bitrate). */
     raop_set_plist(g_raop, "clientFPSdata", 1);
+    /* Accept AirPlay video casts (the "AirPlay" button in video players), not just mirroring. */
+    raop_set_plist(g_raop, "hls", 1);
+    /* Which audio/subtitle renditions to pick from YouTube's master playlists; UxPlay requires
+       a non-empty system language list ("en-US:en"). */
+    raop_set_lang(g_raop, nullptr, nullptr, g_lang_system.c_str());
 
     /* The standard AirPlay ports (as UxPlay's -p option). Fixed ports matter: senders cache
      * the advertised port, so a port that changes on every app start breaks reconnecting. */

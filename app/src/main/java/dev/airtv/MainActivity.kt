@@ -14,6 +14,7 @@ import android.view.SurfaceView
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.TextView
+import androidx.media3.ui.PlayerView
 import java.io.File
 import java.net.Inet4Address
 import kotlin.random.Random
@@ -21,6 +22,7 @@ import kotlin.random.Random
 class MainActivity : Activity(), AirPlayListener {
     private lateinit var root: FrameLayout
     private lateinit var surfaceView: SurfaceView
+    private lateinit var castView: PlayerView
     private lateinit var idleView: View
     private lateinit var nameView: TextView
     private lateinit var hintView: TextView
@@ -33,11 +35,13 @@ class MainActivity : Activity(), AirPlayListener {
     private lateinit var advertiser: ServiceAdvertiser
     private val audio = AudioRenderer()
     private lateinit var video: VideoRenderer
+    private lateinit var cast: CastPlayer
 
     private var receiverName = ""
     private var videoWidth = 0
     private var videoHeight = 0
     @Volatile private var mirroring = false
+    private var casting = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,6 +52,7 @@ class MainActivity : Activity(), AirPlayListener {
         }
         root = findViewById(R.id.root)
         surfaceView = findViewById(R.id.surface)
+        castView = findViewById(R.id.cast_view)
         idleView = findViewById(R.id.idle)
         nameView = findViewById(R.id.receiver_name)
         hintView = findViewById(R.id.hint)
@@ -64,6 +69,12 @@ class MainActivity : Activity(), AirPlayListener {
             onStats = { fps, latencyMs ->
                 runOnUiThread { fpsView.text = getString(R.string.fps_counter, fps, latencyMs) }
             },
+        )
+        cast = CastPlayer(
+            this,
+            castView,
+            onActiveChanged = { active -> runOnUiThread { showCasting(active) } },
+            onStats = { text -> runOnUiThread { if (casting) fpsView.text = text } },
         )
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(holder: SurfaceHolder) = video.setSurface(holder.surface)
@@ -85,6 +96,7 @@ class MainActivity : Activity(), AirPlayListener {
     }
 
     override fun onStop() {
+        cast.releaseNow()
         AirPlayNative.nativeStop()
         advertiser.unregisterAll()
         video.stop()
@@ -98,7 +110,7 @@ class MainActivity : Activity(), AirPlayListener {
         val width = maxOf(metrics.widthPixels, metrics.heightPixels).coerceAtMost(1920)
         val height = minOf(metrics.widthPixels, metrics.heightPixels).coerceAtMost(1080)
         val keyFile = File(filesDir, "airplay-key.pem").absolutePath
-        val port = AirPlayNative.nativeStart(this, receiverName, deviceId(), keyFile, width, height, 60)
+        val port = AirPlayNative.nativeStart(this, receiverName, deviceId(), keyFile, width, height, 60, languages())
         if (port < 0) {
             Log.e(TAG, "receiver failed to start: $port")
             statusView.text = getString(R.string.status_failed, port)
@@ -110,17 +122,37 @@ class MainActivity : Activity(), AirPlayListener {
 
     private fun showMirroring(active: Boolean) {
         mirroring = active
-        idleView.visibility = if (active) View.GONE else View.VISIBLE
-        fpsView.visibility = if (active && showFps) View.VISIBLE else View.GONE
-        if (active) nowPlayingView.visibility = View.GONE
+        updateVisibility()
     }
 
-    /** OK / Enter on the remote toggles the FPS counter. */
+    private fun showCasting(active: Boolean) {
+        casting = active
+        updateVisibility()
+    }
+
+    private fun updateVisibility() {
+        val playing = mirroring || casting
+        idleView.visibility = if (playing) View.GONE else View.VISIBLE
+        castView.visibility = if (casting) View.VISIBLE else View.GONE
+        surfaceView.visibility = if (casting) View.GONE else View.VISIBLE
+        fpsView.visibility = if (playing && showFps) View.VISIBLE else View.GONE
+        if (playing) nowPlayingView.visibility = View.GONE
+    }
+
+    /** OK / Enter on the remote toggles the FPS counter; Back ends a cast. */
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_DPAD_CENTER || keyCode == KeyEvent.KEYCODE_ENTER) {
             showFps = !showFps
             getSharedPreferences("airtv", Context.MODE_PRIVATE).edit().putBoolean("show_fps", showFps).apply()
-            fpsView.visibility = if (mirroring && showFps) View.VISIBLE else View.GONE
+            updateVisibility()
+            return true
+        }
+        if (casting && keyCode in PLAY_PAUSE_KEYS) {
+            cast.togglePlayPause()
+            return true
+        }
+        if (keyCode == KeyEvent.KEYCODE_BACK && casting) {
+            cast.stopFromTv()
             return true
         }
         return super.onKeyDown(keyCode, event)
@@ -174,6 +206,7 @@ class MainActivity : Activity(), AirPlayListener {
 
     override fun onConnection(active: Boolean) {
         Log.i(TAG, "connection active=$active")
+        if (active) cast.stop() // mirroring takes over from any cast
         if (!active) {
             video.reset()
             audio.flush()
@@ -206,7 +239,10 @@ class MainActivity : Activity(), AirPlayListener {
 
     override fun onAudioFlush() = audio.flush()
 
-    override fun onVolume(db: Float) = audio.setVolume(db)
+    override fun onVolume(db: Float) {
+        audio.setVolume(db)
+        cast.setVolume(db)
+    }
 
     override fun onMetadata(title: String, artist: String, album: String) {
         val text = listOf(title, artist, album).filter { it.isNotBlank() }.joinToString("\n")
@@ -216,7 +252,31 @@ class MainActivity : Activity(), AirPlayListener {
         }
     }
 
+    override fun onCastPlay(url: String, startSeconds: Float) = cast.play(url, startSeconds)
+
+    override fun onCastScrub(seconds: Float) = cast.seek(seconds)
+
+    override fun onCastRate(rate: Float) = cast.setRate(rate)
+
+    override fun onCastStop() = cast.stop()
+
+    override fun castPlaybackInfo(): DoubleArray = cast.playbackInfo()
+
+    /** e.g. "en-US:en" from the TV's language settings. */
+    private fun languages(): String {
+        val locales = resources.configuration.locales
+        val tags = LinkedHashSet<String>()
+        for (i in 0 until locales.size()) {
+            tags += locales[i].toLanguageTag()
+            tags += locales[i].language
+        }
+        return tags.filter { it.isNotBlank() }.joinToString(":")
+    }
+
     private companion object {
         const val TAG = "AirTV"
+        val PLAY_PAUSE_KEYS = setOf(
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE,
+        )
     }
 }

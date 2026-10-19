@@ -5,12 +5,16 @@ on the same Wi-Fi see the TV under **Screen Mirroring** and can mirror their scr
 sound, or stream music to it.
 
 Tested on a TCL Android 11 TV (Realtek decoder, 1080p) mirroring from an iPhone 13 Pro Max:
-a steady 30 fps with no dropped frames, and about 30 ms from a frame arriving to it being
-on screen.
+up to a steady 60 fps with no dropped frames, and about 25 ms from a frame arriving to it
+being on screen.
 
 ## Features
 
 - Screen mirroring (H.264) with audio (AAC-ELD), hardware-decoded via `MediaCodec`
+- **Video casting:** the AirPlay button in YouTube, Safari and other players hands the
+  video to the TV, which streams it itself with ExoPlayer (HLS or direct URLs) at the
+  video's own frame rate. The phone can be locked. Pause, seek and volume work from the
+  phone; **play/pause** on the remote toggles playback and **Back** ends the cast
 - AirPlay music (ALAC) with a "now playing" overlay showing title, artist and album
 - The sender's volume slider controls the TV's volume
 - Smooth playback: frames are shown at a steady pace based on the sender's own
@@ -29,6 +33,7 @@ on screen.
 | `ServiceAdvertiser.kt` | Publishes the services through Android's `NsdManager` (the system already owns mDNS port 5353) |
 | `VideoRenderer.kt` | Asynchronous `MediaCodec` decoding onto a `SurfaceView`, paced on the sender's clock; logs fps and delay |
 | `AudioRenderer.kt` | AAC-ELD / AAC-LC via `MediaCodec`, ALAC as PCM from native code, played through `AudioTrack` with a ~250 ms queue cap |
+| `CastPlayer.kt` | ExoPlayer for video casts; answers the sender's playback-info polls from a snapshot, shows the stream's resolution and fps |
 | `MainActivity.kt` | Waiting screen with the receiver name and IP, the video surface, now-playing and fps overlays |
 
 The receiver identifies itself as an Apple TV HD (`AppleTV5,3`) rather than UxPlay's
@@ -79,9 +84,12 @@ Screen Mirroring → pick the TV.
 ## Limitations
 
 - The app must be open on screen to receive (no background service yet).
-- **30 fps for video:** the receiver asks for 60 fps and the sender's encoder accepts it,
-  but iOS screen capture often delivers only 30 fps for video playback. 60 fps video
-  would need AirPlay casting from the video app (HLS), which isn't implemented yet.
+- **Mirroring frame rate is the sender's choice:** the receiver asks for 60 fps, but iOS only
+  captures a new frame when the screen changes, and some apps play video at 30 fps while
+  mirroring. Casting avoids this for apps that have an AirPlay button.
+- DRM-protected apps (Netflix, Apple TV+, Disney+) can't cast.
+- Apps without an AirPlay button in their player (e.g. Facebook) can only be mirrored, so
+  the phone has to stay unlocked.
 - H.264 only (H.265 is off), and no PIN or password.
 - Audio isn't clock-synced to video; each plays as it arrives.
 
